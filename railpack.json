@@ -1,6 +1,8 @@
 {
   "php": {
-    "extensions": ["gd"]
+    "extensions": {
+      "gd": {}
+    }
   }
 }
 

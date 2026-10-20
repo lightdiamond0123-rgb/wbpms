@@ -8,15 +8,17 @@ use Wbpms\Http\Routing\Router;
 use Wbpms\Infrastructure\Database\Connection;
 use Wbpms\Infrastructure\Session\DatabaseSessionHandler;
 
-// Load environment variables from .env file if present.
-// In production, variables are injected by the server/container environment.
-// A single Dotenv instance handles both: load() is skipped when .env is absent
-// (e.g. CI/production) but required() always validates the final environment.
+// Load local environment variables when a .env file exists.
+// Production environments such as Railway inject variables directly.
 $dotenv = Dotenv::createUnsafeMutable(APP_ROOT);
-if (file_exists(APP_ROOT . '/.env')) {
+
+if (is_file(APP_ROOT . '/.env')) {
     $dotenv->load();
 }
-$dotenv->required([
+
+// Populate $_ENV from process environment variables when necessary.
+// This supports PHP installations using variables_order=GPCS.
+$requiredVariables = [
     'APP_ENV',
     'APP_BASE_URL',
     'APP_KEY',
@@ -25,10 +27,24 @@ $dotenv->required([
     'DB_NAME',
     'DB_USER',
     'DB_PASSWORD',
-])->notEmpty();
+];
 
-// Configure PHP error display based on environment.
+foreach ($requiredVariables as $key) {
+    if (!isset($_ENV[$key])) {
+        $value = getenv($key);
+
+        if ($value !== false) {
+            $_ENV[$key] = $value;
+        }
+    }
+}
+
+// Validate environment configuration before starting the application.
+$dotenv->required($requiredVariables)->notEmpty();
+
+// Configure PHP error reporting.
 $appEnv = $_ENV['APP_ENV'] ?? 'production';
+
 if ($appEnv === 'development') {
     ini_set('display_errors', '1');
     ini_set('display_startup_errors', '1');
@@ -39,25 +55,26 @@ if ($appEnv === 'development') {
     error_reporting(0);
 }
 
-// Asia/Manila is the business boundary timezone.
-// Stored instants are UTC; conversion happens here and in repositories.
+// Business timezone for WBPMS.
+// Database timestamps are stored in UTC.
 date_default_timezone_set('Asia/Manila');
 
-// Wire the MySQL-backed session handler (ADR-0001 / ADR-0003).
-// The handler reads DB config from the current environment.
+// Initialize database-backed sessions for web requests.
 if (PHP_SAPI !== 'cli') {
-    $dbConfig    = require APP_ROOT . '/config/database.php';
-    $connection  = new Connection($dbConfig);
+    $dbConfig = require APP_ROOT . '/config/database.php';
+    $connection = new Connection($dbConfig);
+
     $sessionHandler = new DatabaseSessionHandler(
         $connection->pdo(),
-        1800,  // 30-minute idle TTL
-        43200  // 12-hour absolute TTL
+        1800,  // 30-minute idle timeout
+        43200  // 12-hour absolute timeout
     );
+
     session_set_save_handler($sessionHandler, true);
     AuthMiddleware::startSession();
 }
 
-// Build the router and load the explicit route table.
+// Initialize router and register application routes.
 $router = new Router();
 require APP_ROOT . '/routes/web.php';
 

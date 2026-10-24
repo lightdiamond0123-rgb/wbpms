@@ -1,3 +1,4 @@
+
 <?php
 
 declare(strict_types=1);
@@ -17,7 +18,21 @@ if (is_file(APP_ROOT . '/.env')) {
 }
 
 // Populate $_ENV from process environment variables when necessary.
-// This supports PHP installations using variables_order=GPCS.
+// This supports PHP installations using variables_order=GPCS,
+// where Railway-injected variables may be available through getenv()
+// but are not automatically populated into $_ENV.
+$_wbpmsProcessEnv = getenv();
+
+if (is_array($_wbpmsProcessEnv)) {
+    foreach ($_wbpmsProcessEnv as $_wbpmsKey => $_wbpmsVal) {
+        if (!array_key_exists($_wbpmsKey, $_ENV)) {
+            $_ENV[$_wbpmsKey] = $_wbpmsVal;
+        }
+    }
+
+    unset($_wbpmsProcessEnv, $_wbpmsKey, $_wbpmsVal);
+}
+
 $requiredVariables = [
     'APP_ENV',
     'APP_BASE_URL',

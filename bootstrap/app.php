@@ -8,31 +8,41 @@ use Wbpms\Http\Routing\Router;
 use Wbpms\Infrastructure\Database\Connection;
 use Wbpms\Infrastructure\Session\DatabaseSessionHandler;
 
-// Load local environment variables when a .env file exists.
-// Production environments such as Railway inject variables directly.
+// Load environment variables from .env file if present.
+// In production (e.g. Railway), variables are injected by the container into
+// the process environment (accessible via getenv()) rather than $_ENV.
+// Whether PHP populates $_ENV from the process environment depends on the
+// `variables_order` INI setting; on many production stacks it is "GPCS"
+// (no "E"), so $_ENV stays empty for container-injected variables.
+//
+// Strategy:
+//   1. If a .env file exists, load it via phpdotenv (writes to both $_ENV and
+//      putenv/getenv via createUnsafeMutable).
+//   2. After loading, back-fill $_ENV from getenv() for any variable that is
+//      not already present in $_ENV.  This makes Railway-injected variables
+//      visible to all application code that reads $_ENV directly, without
+//      overwriting values that were explicitly set by the .env file.
 $dotenv = Dotenv::createUnsafeMutable(APP_ROOT);
-
-if (is_file(APP_ROOT . '/.env')) {
+if (file_exists(APP_ROOT . '/.env')) {
     $dotenv->load();
 }
 
-// Populate $_ENV from process environment variables when necessary.
-// This supports PHP installations using variables_order=GPCS,
-// where Railway-injected variables may be available through getenv()
-// but are not automatically populated into $_ENV.
+// Back-fill $_ENV from the process environment for variables present in
+// getenv() but absent from $_ENV.  This handles production hosts (Railway,
+// Heroku, Docker) that inject variables through the process environment when
+// no .env file is deployed and PHP's variables_order does not include "E".
+// Existing $_ENV entries (written by phpdotenv above) are never overwritten.
 $_wbpmsProcessEnv = getenv();
-
 if (is_array($_wbpmsProcessEnv)) {
     foreach ($_wbpmsProcessEnv as $_wbpmsKey => $_wbpmsVal) {
         if (!array_key_exists($_wbpmsKey, $_ENV)) {
             $_ENV[$_wbpmsKey] = $_wbpmsVal;
         }
     }
-
     unset($_wbpmsProcessEnv, $_wbpmsKey, $_wbpmsVal);
 }
 
-$requiredVariables = [
+$dotenv->required([
     'APP_ENV',
     'APP_BASE_URL',
     'APP_KEY',
@@ -41,24 +51,10 @@ $requiredVariables = [
     'DB_NAME',
     'DB_USER',
     'DB_PASSWORD',
-];
+])->notEmpty();
 
-foreach ($requiredVariables as $key) {
-    if (!isset($_ENV[$key])) {
-        $value = getenv($key);
-
-        if ($value !== false) {
-            $_ENV[$key] = $value;
-        }
-    }
-}
-
-// Validate environment configuration before starting the application.
-$dotenv->required($requiredVariables)->notEmpty();
-
-// Configure PHP error reporting.
+// Configure PHP error display based on environment.
 $appEnv = $_ENV['APP_ENV'] ?? 'production';
-
 if ($appEnv === 'development') {
     ini_set('display_errors', '1');
     ini_set('display_startup_errors', '1');
@@ -69,26 +65,25 @@ if ($appEnv === 'development') {
     error_reporting(0);
 }
 
-// Business timezone for WBPMS.
-// Database timestamps are stored in UTC.
+// Asia/Manila is the business boundary timezone.
+// Stored instants are UTC; conversion happens here and in repositories.
 date_default_timezone_set('Asia/Manila');
 
-// Initialize database-backed sessions for web requests.
+// Wire the MySQL-backed session handler (ADR-0001 / ADR-0003).
+// The handler reads DB config from the current environment.
 if (PHP_SAPI !== 'cli') {
-    $dbConfig = require APP_ROOT . '/config/database.php';
-    $connection = new Connection($dbConfig);
-
+    $dbConfig    = require APP_ROOT . '/config/database.php';
+    $connection  = new Connection($dbConfig);
     $sessionHandler = new DatabaseSessionHandler(
         $connection->pdo(),
-        1800,  // 30-minute idle timeout
-        43200  // 12-hour absolute timeout
+        1800,  // 30-minute idle TTL
+        43200  // 12-hour absolute TTL
     );
-
     session_set_save_handler($sessionHandler, true);
     AuthMiddleware::startSession();
 }
 
-// Initialize router and register application routes.
+// Build the router and load the explicit route table.
 $router = new Router();
 require APP_ROOT . '/routes/web.php';
 

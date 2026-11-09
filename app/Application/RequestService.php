@@ -6,6 +6,7 @@ namespace Wbpms\Application;
 
 use PDO;
 use RuntimeException;
+use Wbpms\Domain\Payroll\ApprovedOvertimeCalculator;
 use Wbpms\Infrastructure\Database\Connection;
 
 /**
@@ -39,7 +40,12 @@ use Wbpms\Infrastructure\Database\Connection;
  */
 final class RequestService
 {
-    public function __construct(private Connection $connection) {}
+    private ApprovedOvertimeCalculator $approvedOvertimeCalculator;
+
+    public function __construct(private Connection $connection)
+    {
+        $this->approvedOvertimeCalculator = new ApprovedOvertimeCalculator();
+    }
 
     // -----------------------------------------------------------------------
     // Employee — REQ076–REQ080
@@ -197,6 +203,19 @@ final class RequestService
                 ]);
             }
 
+            $pdo->prepare(
+                "INSERT INTO audit_logs
+                    (user_id, event_type, action_performed, table_affected, record_id,
+                     description, action_at, created_at)
+                 VALUES
+                    (:user_id, 'request_submitted', 'submit_request', 'request', :record_id,
+                     :description, NOW(), NOW())"
+            )->execute([
+                ':user_id'     => $employeeId,
+                ':record_id'   => $requestId,
+                ':description' => "Employee {$employeeId} submitted a {$typeName} request (request_id={$requestId}).",
+            ]);
+
             return $requestId;
         });
     }
@@ -217,10 +236,23 @@ final class RequestService
             throw new RuntimeException('Only Pending or Returned requests can be cancelled.');
         }
 
-        $this->connection->transaction(function (PDO $pdo) use ($requestId): void {
+        $this->connection->transaction(function (PDO $pdo) use ($requestId, $employeeId): void {
             $pdo->prepare(
                 "UPDATE request SET status = 'Cancelled', updated_at = NOW() WHERE request_id = :id"
             )->execute([':id' => $requestId]);
+
+            $pdo->prepare(
+                "INSERT INTO audit_logs
+                    (user_id, event_type, action_performed, table_affected, record_id,
+                     description, action_at, created_at)
+                 VALUES
+                    (:user_id, 'request_cancelled', 'cancel_request', 'request', :record_id,
+                     :description, NOW(), NOW())"
+            )->execute([
+                ':user_id'     => $employeeId,
+                ':record_id'   => $requestId,
+                ':description' => "Employee {$employeeId} cancelled request {$requestId}.",
+            ]);
         });
     }
 
@@ -357,6 +389,19 @@ final class RequestService
                         updated_at  = NOW()
                   WHERE request_id  = :id"
             )->execute([':reviewer' => $actingUserId, ':id' => $requestId]);
+
+            $pdo->prepare(
+                "INSERT INTO audit_logs
+                    (user_id, event_type, action_performed, table_affected, record_id,
+                     description, action_at, created_at)
+                 VALUES
+                    (:user_id, 'request_hr_approved', 'hr_approve_request', 'request', :record_id,
+                     :description, NOW(), NOW())"
+            )->execute([
+                ':user_id'     => $actingUserId,
+                ':record_id'   => $requestId,
+                ':description' => "HR pre-approved request {$requestId} (user_id={$actingUserId}).",
+            ]);
         });
     }
 
@@ -415,7 +460,124 @@ final class RequestService
                     ':remaining_amount' => $amount,
                 ]);
             }
+
+            if ($row['type_name'] === 'Overtime') {
+                $this->synchroniseApprovedOvertime(
+                    $pdo,
+                    (int) $row['employee_id'],
+                    (string) $row['overtime_date'],
+                    $actingUserId,
+                    $requestId,
+                );
+            }
+
+            $pdo->prepare(
+                "INSERT INTO audit_logs
+                    (user_id, event_type, action_performed, table_affected, record_id,
+                     description, action_at, created_at)
+                 VALUES
+                    (:user_id, 'request_owner_approved', 'owner_approve_request', 'request', :record_id,
+                     :description, NOW(), NOW())"
+            )->execute([
+                ':user_id'     => $actingUserId,
+                ':record_id'   => $requestId,
+                ':description' => "Owner finally approved request {$requestId} ({$row['type_name']}) for employee {$row['employee_id']}.",
+            ]);
         });
+    }
+
+    /**
+     * An OT request can be approved after its biometric attendance is imported.
+     * Recalculate that unapproved attendance row so the attendance screen and
+     * payroll use the same authorised OT result.
+     */
+    private function synchroniseApprovedOvertime(PDO $pdo, int $employeeId, string $attendanceDate, int $actingUserId, int $requestId): void
+    {
+        $stmt = $pdo->prepare(
+            "SELECT a.attendance_id, a.time_in, a.time_out, a.overtime_minutes,
+                    COALESCE(ws.work_start_time, '07:00:00') AS work_start_time,
+                    COALESCE(ws.work_end_time, '16:00:00') AS work_end_time,
+                    COALESCE(ws.break_minutes, 60) AS break_minutes,
+                    COALESCE(ws.standard_minutes, 480) AS standard_minutes,
+                    COALESCE(ws.overtime_allowed, 0) AS overtime_allowed
+               FROM attendance a
+               LEFT JOIN work_schedule ws ON ws.schedule_id = a.schedule_id
+              WHERE a.employee_id = :employee_id
+                AND a.attendance_date = :attendance_date
+                AND a.status IN ('Complete', 'Approved')
+                AND a.time_in IS NOT NULL
+                AND a.time_out IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM payroll p
+                      JOIN payroll_run pr ON pr.payroll_run_id = p.payroll_run_id
+                      JOIN payroll_period pp ON pp.payroll_period_id = p.payroll_period_id
+                     WHERE p.employee_id = a.employee_id
+                       AND pr.status = 'Approved'
+                       AND a.attendance_date BETWEEN pp.period_start AND pp.period_end
+                )
+              FOR UPDATE"
+        );
+        $stmt->execute([
+            ':employee_id' => $employeeId,
+            ':attendance_date' => $attendanceDate,
+        ]);
+        $attendance = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$attendance || !(bool) $attendance['overtime_allowed']) {
+            return;
+        }
+
+        $requestsStmt = $pdo->prepare(
+            "SELECT ord.start_time, ord.end_time
+               FROM request r
+               JOIN request_type rt ON rt.request_type_id = r.request_type_id
+               JOIN overtime_request_detail ord ON ord.request_id = r.request_id
+              WHERE r.employee_id = :employee_id
+                AND rt.type_name = 'Overtime'
+                AND r.status = 'Approved'
+                AND ord.overtime_date = :attendance_date
+              ORDER BY ord.start_time"
+        );
+        $requestsStmt->execute([
+            ':employee_id' => $employeeId,
+            ':attendance_date' => $attendanceDate,
+        ]);
+        /** @var list<array{start_time:string,end_time:string}> $requests */
+        $requests = $requestsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $overtime = $this->approvedOvertimeCalculator->payableMinutesForAttendance(
+            (string) $attendance['time_in'],
+            (string) $attendance['time_out'],
+            (string) $attendance['work_start_time'],
+            (string) $attendance['work_end_time'],
+            (int) $attendance['break_minutes'],
+            (int) $attendance['standard_minutes'],
+            $requests,
+        );
+        if ($overtime === (int) $attendance['overtime_minutes']) {
+            return;
+        }
+
+        $pdo->prepare(
+            'UPDATE attendance SET overtime_minutes = :overtime, updated_at = NOW() WHERE attendance_id = :id'
+        )->execute([':overtime' => $overtime, ':id' => $attendance['attendance_id']]);
+        $reason = "OT request #{$requestId} was finally approved.";
+        $pdo->prepare(
+            "INSERT INTO attendance_adjustment
+                (attendance_id, adjusted_by, old_time_in, new_time_in, old_time_out, new_time_out,
+                 old_overtime_minutes, new_overtime_minutes, adjustment_type, reason, adjustment_at)
+             VALUES
+                (:attendance_id, :adjusted_by, :time_in, :time_in, :time_out, :time_out,
+                 :old_overtime, :new_overtime, 'overtime_request_approved', :reason, NOW())"
+        )->execute([
+            ':attendance_id' => $attendance['attendance_id'],
+            ':adjusted_by' => $actingUserId,
+            ':time_in' => $attendance['time_in'],
+            ':time_out' => $attendance['time_out'],
+            ':old_overtime' => $attendance['overtime_minutes'],
+            ':new_overtime' => $overtime,
+            ':reason' => $reason,
+        ]);
     }
 
     /**
@@ -444,6 +606,20 @@ final class RequestService
                         updated_at        = NOW()
                   WHERE request_id = :id"
             )->execute([':owner' => $actingUserId, ':note' => trim($note), ':id' => $requestId]);
+
+            $pdo->prepare(
+                "INSERT INTO audit_logs
+                    (user_id, event_type, action_performed, table_affected, record_id,
+                     description, action_at, created_at)
+                 VALUES
+                    (:user_id, 'request_owner_cancelled', 'owner_cancel_request', 'request', :record_id,
+                     :description, NOW(), NOW())"
+            )->execute([
+                ':user_id'     => $actingUserId,
+                ':record_id'   => $requestId,
+                ':description' => "Owner cancelled request {$requestId}."
+                    . ($note !== '' ? " Note: {$note}" : ''),
+            ]);
         });
     }
 
@@ -476,6 +652,19 @@ final class RequestService
                         updated_at        = NOW()
                   WHERE request_id = :id"
             )->execute([':owner' => $actingUserId, ':note' => trim($note), ':id' => $requestId]);
+
+            $pdo->prepare(
+                "INSERT INTO audit_logs
+                    (user_id, event_type, action_performed, table_affected, record_id,
+                     description, action_at, created_at)
+                 VALUES
+                    (:user_id, 'request_owner_returned', 'owner_return_request', 'request', :record_id,
+                     :description, NOW(), NOW())"
+            )->execute([
+                ':user_id'     => $actingUserId,
+                ':record_id'   => $requestId,
+                ':description' => "Owner returned request {$requestId} to HR for revision. Note: {$note}",
+            ]);
         });
     }
 
@@ -508,6 +697,19 @@ final class RequestService
                         updated_at   = NOW()
                   WHERE request_id   = :id"
             )->execute([':reviewer' => $actingUserId, ':note' => trim($note), ':id' => $requestId]);
+
+            $pdo->prepare(
+                "INSERT INTO audit_logs
+                    (user_id, event_type, action_performed, table_affected, record_id,
+                     description, action_at, created_at)
+                 VALUES
+                    (:user_id, 'request_cancelled', 'cancel_request', 'request', :record_id,
+                     :description, NOW(), NOW())"
+            )->execute([
+                ':user_id'     => $actingUserId,
+                ':record_id'   => $requestId,
+                ':description' => "Request {$requestId} cancelled by user {$actingUserId}. Note: {$note}",
+            ]);
         });
     }
 
@@ -540,6 +742,19 @@ final class RequestService
                         updated_at  = NOW()
                   WHERE request_id  = :id"
             )->execute([':by' => $actingUserId, ':id' => $requestId]);
+
+            $pdo->prepare(
+                "INSERT INTO audit_logs
+                    (user_id, event_type, action_performed, table_affected, record_id,
+                     description, action_at, created_at)
+                 VALUES
+                    (:user_id, 'request_archived', 'archive_request', 'request', :record_id,
+                     :description, NOW(), NOW())"
+            )->execute([
+                ':user_id'     => $actingUserId,
+                ':record_id'   => $requestId,
+                ':description' => "Request {$requestId} archived by user {$actingUserId}.",
+            ]);
         });
     }
 

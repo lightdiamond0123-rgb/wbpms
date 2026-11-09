@@ -264,7 +264,7 @@ openEditModal(
 <?php if ($tab === 'periods'): ?>
 
 <p class="muted" style="margin:0 0 1.25rem">
-    Generate all weekly Sunday–Friday cutoffs for a month. A cutoff that crosses a month boundary is included. Government contributions are deducted only on the final Friday payday of each month.
+    Generate all weekly Friday–Thursday cutoffs for a month. Saturday is included in the date range but is a rest day. A cutoff that crosses a month boundary is included. Government contributions are deducted only on the final Friday payday of each month.
 </p>
 
 <div style="display:grid;grid-template-columns:1fr 2fr;gap:1.5rem;align-items:start">
@@ -482,7 +482,7 @@ openEditModal(
                 $hActive = $h['status'] === 'Active';
             ?>
                 <tr style="<?= !$hActive ? 'opacity:.6' : '' ?>">
-                    <td style="white-space:nowrap"><?= Formatter::escape($h['holiday_date']) ?></td>
+                    <td style="white-space:nowrap"><?= Formatter::date($h['holiday_date']) ?></td>
                     <td><strong><?= Formatter::escape($h['description']) ?></strong></td>
                     <td>
                         <?php

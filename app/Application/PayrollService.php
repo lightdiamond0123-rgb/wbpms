@@ -18,7 +18,7 @@ use Wbpms\Infrastructure\Database\Connection;
  * PayrollService — orchestrates the full payroll lifecycle.
  *
  * Responsibilities (ADR-0001):
- *   - Period management (create Sunday→Friday periods).
+ *   - Period management (create Friday→Thursday periods).
  *   - Draft payroll run creation.
  *   - Computation: gross from attendance and approved paid leave; deductions
  *     include late/undertime/contributions/cash-advance; unpaid absences are
@@ -32,7 +32,7 @@ use Wbpms\Infrastructure\Database\Connection;
  * Money is always handled as integer centavos internally, stored as DECIMAL(12,2).
  *
  * ADR-0001 payroll cycle:
- *   period_start = Sunday, period_end = Friday, pay_date = the period-ending Friday.
+ *   period_start = Friday, period_end = Thursday, pay_date = the following Friday.
  *   EEMR = (daily_rate × eemr_days_per_year) / 12.
  *   Late deduction = late_minutes × late_rate_per_minute (default ₱1.00/min).
  *   Undertime deduction = undertime_minutes × (daily_rate / standard_minutes).
@@ -56,8 +56,8 @@ final class PayrollService
     // ===================================================================
 
     /**
-     * Create one Sunday→Friday payroll period.
-     * Validates that the supplied date is a Sunday.
+     * Create one Friday→Thursday payroll period.
+     * Validates that the supplied date is a Friday.
      */
     public function createPeriod(string $periodStart): int
     {
@@ -65,27 +65,34 @@ final class PayrollService
         if ($start === false) {
             throw new RuntimeException('Invalid period start date. Use YYYY-MM-DD format.');
         }
-        if ((int) $start->format('N') !== 7) { // 7 = Sunday
-            throw new RuntimeException('Period start must be a Sunday.');
+        if ((int) $start->format('N') !== 5) { // 5 = Friday
+            throw new RuntimeException('Period start must be a Friday.');
         }
 
-        $end     = $start->modify('+5 days');  // Friday
-        $payDate = $end;                       // Salary is released Friday
+        $end     = $start->modify('+6 days');  // Thursday
+        $payDate = $end->modify('+1 day');     // Salary is released Friday
 
         $pdo = $this->connection->pdo();
 
         // Check for duplicate
-        $chk = $pdo->prepare("SELECT COUNT(*) FROM payroll_period WHERE period_start = :s");
-        $chk->execute([':s' => $start->format('Y-m-d')]);
+        $chk = $pdo->prepare(
+            "SELECT COUNT(*)
+               FROM payroll_period
+              WHERE period_start = :start OR pay_date = :pay_date"
+        );
+        $chk->execute([
+            ':start'    => $start->format('Y-m-d'),
+            ':pay_date' => $payDate->format('Y-m-d'),
+        ]);
         if ((int) $chk->fetchColumn() > 0) {
-            throw new RuntimeException('A payroll period starting on that date already exists.');
+            throw new RuntimeException('A payroll period with that start date or pay date already exists.');
         }
 
         $stmt = $pdo->prepare(
             "INSERT INTO payroll_period
                 (period_start, period_end, pay_date, cutoff_pattern, status, created_at, updated_at)
              VALUES
-                (:start, :end, :pay, 'SundayFriday', 'Open', :created_at, :updated_at)"
+                (:start, :end, :pay, 'FridayThursday', 'Open', :created_at, :updated_at)"
         );
         $now = $this->utcNow();
         $stmt->execute([
@@ -99,7 +106,7 @@ final class PayrollService
     }
 
     /**
-     * Generate every Sunday–Friday cutoff that overlaps a calendar month.
+     * Generate every Friday–Thursday cutoff that overlaps a calendar month.
      * A cutoff may begin in the preceding month or end in the following one.
      *
      * @return array{created:int,existing:int}
@@ -113,11 +120,14 @@ final class PayrollService
         $timezone = new DateTimeZone('Asia/Manila');
         $firstDay = new DateTimeImmutable($month . '-01', $timezone);
         $lastDay = $firstDay->modify('last day of this month');
-        $firstSunday = $firstDay->modify('-' . (int) $firstDay->format('w') . ' days');
+        // DateTime::format('w') is Sunday=0 through Saturday=6. This gives
+        // the Friday on or immediately before the first day of the month.
+        $daysSinceFriday = ((int) $firstDay->format('w') + 2) % 7;
+        $firstFriday = $firstDay->modify('-' . $daysSinceFriday . ' days');
         $created = 0;
         $existing = 0;
 
-        for ($start = $firstSunday; $start <= $lastDay; $start = $start->modify('+7 days')) {
+        for ($start = $firstFriday; $start <= $lastDay; $start = $start->modify('+7 days')) {
             try {
                 $this->createPeriod($start->format('Y-m-d'));
                 $created++;
@@ -534,7 +544,7 @@ final class PayrollService
                        LEFT JOIN attendance_import_batch aib ON aib.import_batch_id = a.import_batch_id
                       WHERE a.employee_id = :emp_id
                         AND attendance_date BETWEEN :start AND :end
-                        AND a.status IN ('Complete','Approved','ReviewRequired')
+                        AND a.status IN ('Complete','Approved')
                         AND (a.import_batch_id IS NULL OR aib.status IN ('Approved','Completed'))"
                 );
                 $stmt->execute([':emp_id' => $employeeId, ':start' => $periodStart, ':end' => $periodEnd]);
@@ -890,6 +900,21 @@ final class PayrollService
         if ($updated->rowCount() !== 1) {
             throw new RuntimeException('This payroll run changed status and can no longer be submitted.');
         }
+
+        $pdo->prepare(
+            "INSERT INTO audit_logs
+                (user_id, event_type, action_performed, table_affected, record_id,
+                 description, action_at, created_at)
+             VALUES
+                (:user_id, 'payroll_submitted', 'submit_payroll_run', 'payroll_run', :record_id,
+                 :description, :action_at, :created_at)"
+        )->execute([
+            ':user_id'     => $submittedByUserId,
+            ':record_id'   => $runId,
+            ':description' => "Payroll run {$runId} submitted for Owner approval.",
+            ':action_at'   => $submittedNow,
+            ':created_at'  => $submittedNow,
+        ]);
     }
 
     public function approve(int $runId, int $reviewedByUserId): void
@@ -919,7 +944,22 @@ final class PayrollService
                 throw new RuntimeException('This payroll run changed status and can no longer be approved.');
             }
 
-            // 2. Generate one payslip row per employee payroll row (REQ048)
+            // 2. Payroll approval finalizes all of its generated contribution records.
+            // Individual records cannot be independently locked or reopened.
+            $pdo->prepare(
+                "UPDATE contribution_record cr
+                   JOIN payroll p ON p.payroll_id = cr.payroll_id
+                    SET cr.status    = 'Locked',
+                        cr.locked_at = :locked_at,
+                        cr.locked_by = :locked_by
+                  WHERE p.payroll_run_id = :run_id"
+            )->execute([
+                ':locked_at' => $now,
+                ':locked_by' => $reviewedByUserId,
+                ':run_id'    => $runId,
+            ]);
+
+            // 3. Generate one payslip row per employee payroll row (REQ048)
             // Skip employees that already have a payslip for this run
             $stmt = $pdo->prepare(
                 "SELECT p.payroll_id
@@ -946,6 +986,22 @@ final class PayrollService
                     ':generated_at' => $now,
                 ]);
             }
+
+            // 4. Audit log
+            $pdo->prepare(
+                "INSERT INTO audit_logs
+                    (user_id, event_type, action_performed, table_affected, record_id,
+                     description, action_at, created_at)
+                 VALUES
+                    (:user_id, 'payroll_approved', 'approve_payroll_run', 'payroll_run', :record_id,
+                     :description, :action_at, :created_at)"
+            )->execute([
+                ':user_id'     => $reviewedByUserId,
+                ':record_id'   => $runId,
+                ':description' => "Payroll run {$runId} approved by Owner. {$this->payslipCountMsg(count($payrollIds))}",
+                ':action_at'   => $now,
+                ':created_at'  => $now,
+            ]);
         });
     }
 
@@ -981,6 +1037,21 @@ final class PayrollService
         if ($updated->rowCount() !== 1) {
             throw new RuntimeException('This payroll run changed status and can no longer be returned.');
         }
+
+        $pdo->prepare(
+            "INSERT INTO audit_logs
+                (user_id, event_type, action_performed, table_affected, record_id,
+                 description, action_at, created_at)
+             VALUES
+                (:user_id, 'payroll_returned', 'return_payroll_run', 'payroll_run', :record_id,
+                 :description, :action_at, :created_at)"
+        )->execute([
+            ':user_id'     => $reviewedByUserId,
+            ':record_id'   => $runId,
+            ':description' => "Payroll run {$runId} returned to HR for revision. Reason: {$reason}",
+            ':action_at'   => $now,
+            ':created_at'  => $now,
+        ]);
     }
 
     /**
@@ -1361,23 +1432,37 @@ final class PayrollService
         }
 
         $stmt = $pdo->prepare(
-            "SELECT a.attendance_date, a.time_out, a.overtime_minutes
+            "SELECT a.attendance_date, a.time_in, a.time_out,
+                    COALESCE(ws.work_start_time, '07:00:00') AS work_start_time,
+                    COALESCE(ws.work_end_time, '16:00:00') AS work_end_time,
+                    COALESCE(ws.break_minutes, 60) AS break_minutes,
+                    COALESCE(ws.standard_minutes, 480) AS standard_minutes,
+                    COALESCE(ws.overtime_allowed, 0) AS overtime_allowed
                FROM attendance a
                LEFT JOIN attendance_import_batch aib ON aib.import_batch_id = a.import_batch_id
+               LEFT JOIN work_schedule ws ON ws.schedule_id = a.schedule_id
               WHERE a.employee_id = :emp_id
                 AND a.attendance_date BETWEEN :start AND :end
                 AND a.status IN ('Complete', 'Approved')
                 AND (a.import_batch_id IS NULL OR aib.status IN ('Approved','Completed'))
-                AND a.overtime_minutes > 0"
+                AND a.time_in IS NOT NULL
+                AND a.time_out IS NOT NULL"
         );
         $stmt->execute([':emp_id' => $employeeId, ':start' => $periodStart, ':end' => $periodEnd]);
 
         $payable = [];
         foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            if (!(bool) $row['overtime_allowed']) {
+                continue;
+            }
             $date = (string) $row['attendance_date'];
-            $minutes = $this->approvedOvertimeCalc->payableMinutes(
-                (int) $row['overtime_minutes'],
+            $minutes = $this->approvedOvertimeCalc->payableMinutesForAttendance(
+                $row['time_in'] !== null ? (string) $row['time_in'] : null,
                 $row['time_out'] !== null ? (string) $row['time_out'] : null,
+                (string) $row['work_start_time'],
+                (string) $row['work_end_time'],
+                (int) $row['break_minutes'],
+                (int) $row['standard_minutes'],
                 $approvedOtByDate[$date] ?? [],
             );
             if ($minutes > 0) {
@@ -1856,6 +1941,13 @@ final class PayrollService
             return false;
         }
         return $date->format('Y-m-d') === $date->modify('last friday of this month')->format('Y-m-d');
+    }
+
+    private function payslipCountMsg(int $count): string
+    {
+        return $count === 0
+            ? 'No new payslips generated (all already existed).'
+            : "{$count} payslip(s) generated.";
     }
 
     private function utcNow(): string

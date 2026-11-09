@@ -13,6 +13,7 @@ use Wbpms\Application\Attendance\AttendancePunchMatch;
 use Wbpms\Domain\Attendance\GeneratedAttendance;
 use Wbpms\Domain\Attendance\WorkSchedule;
 use Wbpms\Domain\Attendance\Parsing\ParsedPunch;
+use Wbpms\Domain\Payroll\ApprovedOvertimeCalculator;
 use Wbpms\Infrastructure\Database\Connection;
 
 /**
@@ -26,12 +27,14 @@ final class PdoAttendanceImportGateway implements AttendanceImportGateway
 {
     private PDO $pdo;
     private Connection $connection;
+    private ApprovedOvertimeCalculator $approvedOvertimeCalculator;
 
     public function __construct(PDO $pdo)
     {
         $this->pdo = $pdo;
         // Wrap PDO in Connection so we can delegate transaction()
         $this->connection = new Connection([], $pdo);
+        $this->approvedOvertimeCalculator = new ApprovedOvertimeCalculator();
     }
 
     // -----------------------------------------------------------------------
@@ -271,7 +274,7 @@ final class PdoAttendanceImportGateway implements AttendanceImportGateway
 
         $stmt = $this->pdo->prepare(
             "SELECT schedule_id, work_start_time, work_end_time,
-                    break_minutes, standard_minutes, grace_minutes
+                    break_minutes, standard_minutes, grace_minutes, overtime_allowed
                FROM work_schedule
               WHERE schedule_id = :id"
         );
@@ -289,6 +292,7 @@ final class PdoAttendanceImportGateway implements AttendanceImportGateway
             (int) $row['break_minutes'],
             (int) $row['standard_minutes'],
             (int) $row['grace_minutes'],
+            (bool) $row['overtime_allowed'],
         );
     }
 
@@ -390,17 +394,7 @@ final class PdoAttendanceImportGateway implements AttendanceImportGateway
 
     public function saveGeneratedAttendance(int $batchId, GeneratedAttendance $attendance): void
     {
-        $now      = $this->utcNow();
-        $timeIn   = $attendance->timeIn  ? $attendance->timeIn->format('H:i:s')  : null;
-        $timeOut  = $attendance->timeOut ? $attendance->timeOut->format('H:i:s') : null;
-
-        // Determine status from flags
-        $status = 'Complete';
-        if ($attendance->isIncomplete()) {
-            $status = 'Incomplete';
-        } elseif (in_array('MULTI_PUNCH_REVIEW', $attendance->flags, true)) {
-            $status = 'ReviewRequired';
-        }
+        $now = $this->utcNow();
 
         // Resolve branch_assignment_id and schedule_id for this employee/date
         $punchDate = $attendance->attendanceDate;
@@ -435,6 +429,17 @@ final class PdoAttendanceImportGateway implements AttendanceImportGateway
         ]);
         $schRow     = $stmt->fetch(PDO::FETCH_ASSOC);
         $scheduleId = $schRow ? (int) $schRow['schedule_id'] : null;
+        $schedule   = $this->effectiveSchedule($scheduleId, $punchDate);
+        $resolved   = $this->reconcileAttendance($attendance, $schedule);
+        $timeIn     = $resolved['time_in'];
+        $timeOut    = $resolved['time_out'];
+        $overtime   = $this->approvedOvertimeMinutes(
+            $attendance->employeeId,
+            $attendance->attendanceDate,
+            $timeIn,
+            $timeOut,
+            $schedule,
+        );
 
         // Check for an existing attendance row for this employee+date.
         //
@@ -496,6 +501,7 @@ final class PdoAttendanceImportGateway implements AttendanceImportGateway
                         "UPDATE attendance
                             SET time_in              = :time_in,
                                 time_out             = :time_out,
+                                schedule_id          = :schedule_id,
                                 hours_worked_minutes = :worked,
                                 late_minutes         = :late,
                                 undertime_minutes    = :undertime,
@@ -507,11 +513,12 @@ final class PdoAttendanceImportGateway implements AttendanceImportGateway
                     )->execute([
                         ':time_in'    => $timeIn,
                         ':time_out'   => $timeOut,
-                        ':worked'     => $attendance->workedMinutes,
-                        ':late'       => $attendance->lateMinutes,
-                        ':undertime'  => $attendance->undertimeMinutes,
-                        ':overtime'   => $attendance->overtimeMinutes,
-                        ':status'     => $status,
+                        ':schedule_id'=> $scheduleId,
+                        ':worked'     => $resolved['worked'],
+                        ':late'       => $resolved['late'],
+                        ':undertime'  => $resolved['undertime'],
+                        ':overtime'   => $overtime,
+                        ':status'     => $resolved['status'],
                         ':batch_id'   => $batchId,
                         ':updated_at' => $now,
                         ':id'         => $existingId,
@@ -546,11 +553,11 @@ final class PdoAttendanceImportGateway implements AttendanceImportGateway
             ':date'       => $punchDate,
             ':time_in'    => $timeIn,
             ':time_out'   => $timeOut,
-            ':worked'     => $attendance->workedMinutes,
-            ':late'       => $attendance->lateMinutes,
-            ':undertime'  => $attendance->undertimeMinutes,
-            ':overtime'   => $attendance->overtimeMinutes,
-            ':status'     => $status,
+            ':worked'     => $resolved['worked'],
+            ':late'       => $resolved['late'],
+            ':undertime'  => $resolved['undertime'],
+            ':overtime'   => $overtime,
+            ':status'     => $resolved['status'],
             ':batch_id'   => $batchId,
             ':created_at' => $now,
             ':updated_at' => $now,
@@ -560,6 +567,122 @@ final class PdoAttendanceImportGateway implements AttendanceImportGateway
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
+
+    /**
+     * Attendance records only retain overtime that an approved request
+     * authorizes and that overlaps the employee's actual overtime window.
+     */
+    private function approvedOvertimeMinutes(int $employeeId, string $attendanceDate, ?string $timeIn, ?string $timeOut, WorkSchedule $schedule): int
+    {
+        if ($timeIn === null || $timeOut === null || !$schedule->overtimeAllowed) {
+            return 0;
+        }
+
+        $stmt = $this->pdo->prepare(
+            "SELECT ord.start_time, ord.end_time
+               FROM request r
+               JOIN request_type rt ON rt.request_type_id = r.request_type_id
+               JOIN overtime_request_detail ord ON ord.request_id = r.request_id
+              WHERE r.employee_id = :employee_id
+                AND rt.type_name = 'Overtime'
+                AND r.status = 'Approved'
+                AND ord.overtime_date = :attendance_date
+              ORDER BY ord.start_time"
+        );
+        $stmt->execute([
+            ':employee_id' => $employeeId,
+            ':attendance_date' => $attendanceDate,
+        ]);
+
+        /** @var list<array{start_time:string,end_time:string}> $requests */
+        $requests = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        return $this->approvedOvertimeCalculator->payableMinutesForAttendance(
+            $timeIn,
+            $timeOut,
+            $schedule->startTime,
+            $schedule->endTime,
+            $schedule->unpaidBreakMinutes,
+            $schedule->standardMinutes,
+            $requests,
+        );
+    }
+
+    /**
+     * Combine all retained punches for the employee/date. This lets a later
+     * import containing only a missing time-out complete an earlier one-punch
+     * record without discarding either raw biometric event.
+     *
+     * @return array{time_in:?string,time_out:?string,worked:int,late:int,undertime:int,status:string}
+     */
+    private function reconcileAttendance(GeneratedAttendance $attendance, WorkSchedule $schedule): array
+    {
+        $stmt = $this->pdo->prepare(
+            "SELECT source_local_at
+               FROM biometric_punch
+              WHERE employee_id = :employee_id
+                AND match_status = :matched
+                AND DATE(source_local_at) = :attendance_date
+              ORDER BY source_local_at"
+        );
+        $stmt->execute([
+            ':employee_id' => $attendance->employeeId,
+            ':matched' => AttendancePunchMatch::MATCHED,
+            ':attendance_date' => $attendance->attendanceDate,
+        ]);
+        $punches = $stmt->fetchAll(PDO::FETCH_COLUMN);
+        if ($punches === []) {
+            return [
+                'time_in' => $attendance->timeIn?->format('H:i:s'),
+                'time_out' => $attendance->timeOut?->format('H:i:s'),
+                'worked' => $attendance->workedMinutes,
+                'late' => $attendance->lateMinutes,
+                'undertime' => $attendance->undertimeMinutes,
+                'status' => $attendance->isIncomplete() ? 'Incomplete' : (count($attendance->punches) > 2 ? 'ReviewRequired' : 'Complete'),
+            ];
+        }
+
+        $timezone = new DateTimeZone('Asia/Manila');
+        $timeIn = new DateTimeImmutable((string) $punches[0], $timezone);
+        $timeOut = count($punches) > 1 ? new DateTimeImmutable((string) $punches[array_key_last($punches)], $timezone) : null;
+        if ($timeOut === null) {
+            return [
+                'time_in' => $timeIn->format('H:i:s'),
+                'time_out' => null,
+                'worked' => 0,
+                'late' => 0,
+                'undertime' => 0,
+                'status' => 'Incomplete',
+            ];
+        }
+
+        [$worked, $late, $undertime] = $this->calculateAttendanceMinutes($timeIn, $timeOut, $schedule);
+        return [
+            'time_in' => $timeIn->format('H:i:s'),
+            'time_out' => $timeOut->format('H:i:s'),
+            'worked' => $worked,
+            'late' => $late,
+            'undertime' => $undertime,
+            'status' => count($punches) > 2 ? 'ReviewRequired' : 'Complete',
+        ];
+    }
+
+    /** @return array{int,int,int} worked, late, undertime */
+    private function calculateAttendanceMinutes(DateTimeImmutable $timeIn, DateTimeImmutable $timeOut, WorkSchedule $schedule): array
+    {
+        $scheduledStart = $schedule->startOn($timeIn, $timeIn->getTimezone());
+        $scheduledEnd = $schedule->endOn($timeIn, $timeIn->getTimezone());
+        if ($scheduledEnd <= $scheduledStart) {
+            $scheduledEnd = $scheduledEnd->modify('+1 day');
+            if ($timeOut <= $timeIn) {
+                $timeOut = $timeOut->modify('+1 day');
+            }
+        }
+        $elapsed = max(0, intdiv($timeOut->getTimestamp() - $timeIn->getTimestamp(), 60));
+        $worked = max(0, $elapsed - $schedule->unpaidBreakMinutes);
+        $late = max(0, intdiv($timeIn->getTimestamp() - $scheduledStart->getTimestamp(), 60) - $schedule->graceMinutes);
+        $undertime = max(0, intdiv($scheduledEnd->getTimestamp() - $timeOut->getTimestamp(), 60));
+        return [$worked, $late, $undertime];
+    }
 
     private function utcNow(): string
     {

@@ -14,7 +14,7 @@ final class Formatter
             return '—';
         }
         $date = is_string($value) ? new \DateTimeImmutable($value) : $value;
-        return $date->format('m/d/Y');
+        return $date->format('m/d/y');
     }
 
     public static function time(DateTimeInterface|string|null $value): string
@@ -24,6 +24,15 @@ final class Formatter
         }
         $date = is_string($value) ? new \DateTimeImmutable($value) : $value;
         return $date->format('H:i');
+    }
+
+    public static function dateTime(DateTimeInterface|string|null $value): string
+    {
+        if ($value === null || $value === '') {
+            return '—';
+        }
+        $date = is_string($value) ? new \DateTimeImmutable($value) : $value;
+        return $date->format('m/d/Y h:i A');
     }
 
     public static function escape(string|int|float|null $value): string

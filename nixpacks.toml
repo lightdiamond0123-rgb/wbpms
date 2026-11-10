@@ -8,7 +8,7 @@ nixPkgs = ["php83", "php83Extensions.pdo", "php83Extensions.pdo_mysql", "php83Ex
 cmds = ["composer install --no-dev --optimize-autoloader --no-interaction"]
 
 [phases.build]
-cmds = []
+cmds = ["vendor/bin/phinx migrate -c phinx.php -e production"]
 
 [start]
 cmd = "php -S 0.0.0.0:$PORT -t public/ ../router.php"
